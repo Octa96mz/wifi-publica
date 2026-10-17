@@ -267,5 +267,5 @@ Siguientes pasos (mira docs/GUIA-PRUEBA.md):
      y borra los originales (contienen tu clave privada) con el shred -u que te muestra
   3. wifi-publica vpn list / vpn use <servidor> / vpn on
   4. Atajos: hypr/bindings.lua → ~/.config/hypr/bindings.lua (comprueba conflictos)
-Recuperación de emergencia: sudo nft delete table inet wifipublica
+Recuperación de emergencia: sudo nft delete table inet wifipublica; sudo wg-quick down home
 EOF

@@ -131,10 +131,10 @@ En orden, de menos a más drástico:
 1. `wifi-publica off`
 2. Si no responde o falla:
    ```bash
-   sudo nft delete table inet wifipublica       # quita firewall y kill switch
-   sudo wg-quick down home                      # baja la VPN
+   sudo nft delete table inet wifipublica; sudo wg-quick down home   # quita firewall y kill switch, y baja la VPN
    sudo systemctl stop wifi-publica-portal.timer
    ```
+   Hacen falta las dos partes: wg-quick envía todo el tráfico sin su marca a la tabla de rutas 51820, es decir, al túnel; si solo quitas el firewall y el túnel está caído, sigues sin red.
 3. Si la wifi sigue rara (MAC, DNS, IPv6), los cambios eran `--temporary` (solo en memoria; NetworkManager los guarda en `/run`, así que un reinicio los borra). Para dejarlos a mano con los valores por defecto de NetworkManager:
    ```bash
    nmcli connection modify --temporary "<tu wifi>" \

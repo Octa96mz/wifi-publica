@@ -62,7 +62,7 @@ wifi-publica — protección para redes wifi públicas + VPN WireGuard
 
 Opciones: --dry-run  --yes  --keep-docker  --keep-tailscale  --browser  --json  --seconds N
 
-Recuperación de emergencia:  sudo nft delete table inet wifipublica
+Recuperación de emergencia:  sudo nft delete table inet wifipublica; sudo wg-quick down home
 EOF
 }
 

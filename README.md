@@ -46,7 +46,7 @@ $ wifi-publica on
 - **Runtime-only** – `nft`, `sysctl -w`, `systemctl stop` (never `disable`), `nmcli connection modify --temporary` (in memory, never written to `/etc/NetworkManager`). No system config file is edited.
 - **Idempotent** – `on` twice is safe; if you switch networks while active, `on` moves the measures to the new connection.
 - **Transactional** – a failure halfway through `on` triggers a rollback of everything already applied (EXIT trap, `set -euo pipefail`). nftables changes are single atomic transactions.
-- **Never bricks the network** – `off` or `sudo nft delete table inet wifipublica` always restores connectivity. The VPN step only enables the kill switch *after* the tunnel is verified.
+- **Never bricks the network** – `off` or `sudo nft delete table inet wifipublica; sudo wg-quick down home` is designed to restore connectivity. Both halves are needed: wg-quick sends all traffic without its mark to routing table 51820, i.e. into the tunnel, so removing only the firewall leaves a dead tunnel still capturing everything. The VPN step only enables the kill switch *after* the tunnel is verified.
 - **Least privilege** – two root-owned entry points: everyday actions run passwordless, but importing a server lives in a separate executable that always asks for your password. Both validate every argument and refuse to run if their own files are writable by anyone but root.
 - **Dry run** – `--dry-run` prints every command and the full nftables ruleset without touching anything.
 - **No dependencies** beyond what Arch already ships (bash, nftables, NetworkManager, systemd, wireguard-tools, curl).
@@ -54,7 +54,7 @@ $ wifi-publica on
 ## Installation
 
 ```bash
-git clone <this repo> && cd wifi-publica
+git clone https://github.com/Octa96mz/wifi-publica.git && cd wifi-publica
 ./tests/run.sh                       # pure-function tests, touch nothing
 unshare -rn ./tests/netns-killswitch.sh   # functional kill-switch test in an isolated netns
 less install.sh                      # read it first
@@ -122,6 +122,8 @@ wifi-publica --dry-run vpn import ~/Downloads/vpn/*.conf
 wifi-publica vpn import ~/Downloads/vpn/*.conf
 ```
 
+`wifi-publica vpn import` does not import anything itself: it forwards to `wifi-publica-import`, the separate executable that always asks for your password (see [Security notes](#security-notes)).
+
 Every file goes through the full secure path independently, with its own
 temporary copy. Invalid files (forbidden keys, symlinks, FIFOs, files not
 owned by you, invalid or already-used names) are **skipped** without aborting
@@ -164,6 +166,8 @@ Open <http://neverssl.com> to trigger the portal page and never type real
 passwords into it.
 
 ### Example audit
+
+*Illustrative, trimmed example (not a captured run).*
 
 ```
 $ wifi-publica audit
@@ -273,6 +277,37 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
 - Code executed as root must be owned by root and not writable by anyone else (including every parent directory). Otherwise your user could edit the script and run anything as root without a password. The script verifies this on every privileged start (`verify_install_integrity`).
 - `PreUp/PostUp/PreDown/PostDown` are rejected on import: wg-quick runs them as root, which would turn "import a config" into "run arbitrary code as root".
 - No private keys in code, logs, notifications or tests. Tests use fake keys and RFC 5737/3849 documentation IPs.
+
+## Status and development
+
+This is a personal, experimental project. It was developed with AI assistance
+(Claude Code); the code was reviewed and tested by the author.
+
+What the automated tests cover:
+
+- `./tests/run.sh` (also run in CI as an unprivileged user, together with
+  `shellcheck`): pure-function tests that change nothing on the system —
+  nftables ruleset generation (including endpoint changes), `.conf`
+  validation, single and batch import, server removal, privilege separation
+  between the two executables, parsing of simulated `ss`/`docker`/`nmcli`/`wg`
+  output, audit checks against nft fixtures, hostname handling, the public-IP
+  check and CLI messages.
+- `unshare -rn ./tests/netns-killswitch.sh`: loads the generated ruleset in an
+  isolated network namespace with dummy interfaces and checks which traffic is
+  allowed or blocked, with and without kill switch and after deleting the table.
+- `unshare -rnm ./tests/netns-publicip.sh`: reproduces wg-quick's routing
+  (table 51820, fwmark, `suppress_prefixlength`) in an isolated namespace and
+  checks that the public-IP request leaves only through `home`.
+
+The netns tests need `unshare` and are not part of CI.
+
+Not yet validated on a real public network:
+
+- Captive portal flow (`wifi-publica portal`) against a real portal.
+- Toggling the mode from the bar padlock, without a terminal (the Docker
+  "pause containers?" question cannot be asked there; the default applies).
+- Keyboard shortcuts from `hypr/bindings.lua`.
+- End-to-end test on a phone hotspot.
 
 ## License
 
