@@ -1,0 +1,30 @@
+# nft list table inet wifipublica — nftables v1.1.7 (Commodore Bullmoose #8), generado con nft_build_ruleset 1 0 192.0.2.10 51820 0
+table inet wifipublica {
+	chain input {
+		type filter hook input priority -100; policy drop;
+		iifname "lo" accept
+		ct state invalid drop
+		ct state established,related accept
+		udp sport 67 udp dport 68 accept comment "dhcpv4"
+		icmpv6 type { nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert } ip6 hoplimit 255 accept
+		counter packets 0 bytes 0 comment "wp-input-drop"
+	}
+
+	chain forward {
+		type filter hook forward priority -100; policy accept;
+		iifname "docker0" oifname != "home" oifname != "docker0" drop comment "wp-ks-forward"
+		iifname "br-*" oifname != "home" oifname != "br-*" drop comment "wp-ks-forward"
+		ct state established,related accept
+		ct status dnat ct state new drop comment "wp-docker-published"
+		iifname "home" ct state new drop
+	}
+
+	chain output {
+		type filter hook output priority dstnat; policy drop;
+		oifname "lo" accept
+		udp sport 68 udp dport 67 accept comment "dhcpv4"
+		oifname "home" accept comment "wp-tunnel"
+		ip daddr 192.0.2.10 udp dport 51820 accept comment "wp-endpoint"
+		counter packets 0 bytes 0 comment "wp-output-drop"
+	}
+}

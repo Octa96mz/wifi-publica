@@ -1,0 +1,23 @@
+# /etc/sudoers.d/wifi-publica — EJEMPLO. install.sh lo genera con tu usuario
+# (lib/sudoers.sh) y lo valida con "visudo -cf" antes de instalarlo
+# (permisos 0440 root:root). Sustituye TU_USUARIO por tu nombre de usuario.
+#
+# Por qué los scripts deben ser de root y no editables por tu usuario: si
+# pudieras modificar /usr/local/lib/wifi-publica (o un directorio padre),
+# podrías añadir cualquier comando y ejecutarlo como root: escalada trivial.
+# Ambos scripts lo comprueban al arrancar como root (verify_install_integrity).
+#
+# Dos ejecutables, dos reglas. Ninguna lleva argumentos: sudo elige la regla
+# por el fichero ejecutado (ruta o dispositivo/inodo), no por comodines en
+# los argumentos, que son evadibles (ver lib/sudoers.sh).
+
+# 1) Uso normal SIN contraseña. Este script no contiene código de importación.
+TU_USUARIO ALL=(root) NOPASSWD: /usr/local/lib/wifi-publica/bin/wifi-publica
+
+# 2) Importar servidores CON contraseña, pedida siempre (sin caché de sudo).
+Defaults!/usr/local/lib/wifi-publica/bin/wifi-publica-import timestamp_timeout=0
+TU_USUARIO ALL=(root) PASSWD: /usr/local/lib/wifi-publica/bin/wifi-publica-import
+
+# Opcional: no registrar en el journal cada consulta de la barra (cada 30 s
+# con la VPN activa). Descomenta solo si te molesta el ruido:
+# Defaults!/usr/local/lib/wifi-publica/bin/wifi-publica !syslog

@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    container: archlinux:base
+    steps:
+      - name: Instalar dependencias
+        run: pacman -Syu --noconfirm --needed git shellcheck python diffutils
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      # Nivel "warning": las notas de nivel info/style que quedan son
+      # intencionadas (SC2317: mocks y traps invocados indirectamente;
+      # SC2016: cadenas literales buscadas en el código; SC2015: A && B || C
+      # donde ejecutar C si B falla es el comportamiento deseado).
+      - name: shellcheck
+        run: |
+          shellcheck -x -S warning \
+            bin/wifi-publica bin/wifi-publica-import install.sh uninstall.sh \
+            lib/*.sh measures/*.sh tests/*.sh
+
+      # Los tests comprueban que los ejecutables se niegan sin root, así que
+      # se ejecutan como un usuario sin privilegios. No necesitan red, nft,
+      # nmcli ni wg-quick (los netns-*.sh quedan fuera: requieren unshare).
+      - name: tests
+        run: |
+          useradd -m ci
+          chown -R ci: "$GITHUB_WORKSPACE"
+          su ci -c "cd '$GITHUB_WORKSPACE' && ./tests/run.sh"

@@ -1,0 +1,20 @@
+# Diffs y parches de trabajo (contienen salidas de pruebas locales)
+*.diff
+*.patch
+*.orig
+*.rej
+
+# Configuraciones WireGuard u otras: pueden contener claves privadas
+*.conf
+
+# Estado y registros generados en tiempo de ejecución
+state.json
+*.log
+
+# Editor / sistema
+*~
+*.swp
+.*.swp
+.DS_Store
+.vscode/
+.idea/

@@ -1,0 +1,740 @@
+#!/usr/bin/env bash
+# wifi-publica — Modo Wifi Pública + capa VPN (WireGuard / Proton VPN Free)
+#
+# Uso: wifi-publica [opciones] on|off|toggle|status|portal|audit
+#      wifi-publica [opciones] vpn on|off|toggle|status|list|use <srv>|next|prev|import <f.conf> [nombre]|menu
+#
+# Como usuario normal: lee el estado sin root y, para lo que lo necesita, se
+# reejecuta con sudo (la regla sudoers permite SOLO este script). Como root,
+# valida estrictamente cada argumento: todos llegan con privilegios de root.
+
+set -euo pipefail
+umask 022
+PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin
+export PATH LC_ALL=C.UTF-8
+
+WP_BASE=$(cd -P -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/.." && pwd)
+
+if (( EUID == 0 )); then
+  # Antes de cargar nada: el código que se ejecuta como root debe ser de root.
+  # shellcheck source=../lib/common.sh
+  source "/usr/local/lib/wifi-publica/lib/common.sh"
+  verify_install_integrity "$WP_BASE"
+fi
+
+for _f in common state parse wgconf nft nm vpn cli; do
+  # shellcheck source=/dev/null
+  source "$WP_BASE/lib/$_f.sh"
+done
+MEASURES=(services docker bluetooth autoconnect tailscale hostname mac dns ipv6 firewall vpn session)
+for _m in "${MEASURES[@]}" browser; do
+  # shellcheck source=/dev/null
+  source "$WP_BASE/measures/$_m.sh"
+done
+unset _f _m
+
+# Pesos del audit (suman 100).
+declare -A WEIGHT=(
+  [firewall]=20 [vpn]=20 [dns]=15 [mac]=10 [services]=8 [docker]=7
+  [ipv6]=5 [bluetooth]=4 [hostname]=3 [autoconnect]=3 [session]=3 [tailscale]=2
+)
+
+usage() {
+  cat <<'EOF'
+wifi-publica — protección para redes wifi públicas + VPN WireGuard
+
+  on              activa el modo (firewall, MAC aleatoria, DNS cifrado, ... y kill switch si hay VPN)
+  off             lo desactiva y restaura exactamente el estado anterior
+  toggle          on/off según el estado actual
+  status [--json] estado en una línea (o JSON para la barra)
+  portal          abre solo DNS/HTTP/HTTPS para iniciar sesión en un portal cautivo y
+                  reactiva el modo a los 180 s (--seconds N, 30-900)
+  audit           comprobación de solo lectura con puntuación sobre 100
+
+  vpn on|off|toggle         enciende/apaga la VPN (interfaz "home")
+  vpn status [--json]       estado de la VPN
+  vpn list [--plain]        servidores guardados (* = activo)
+  vpn use <servidor>        cambia de servidor (atómico, con vuelta atrás si falla)
+  vpn next|prev             siguiente/anterior servidor guardado
+  vpn import <f.conf>...    importa hasta 20 .conf de Proton (SIEMPRE pide tu contraseña)
+  vpn import <f.conf> <nombre>  uno solo, con nombre propio
+  vpn menu                  selector gráfico (walker → fuzzel → wofi)
+
+Opciones: --dry-run  --yes  --keep-docker  --keep-tailscale  --browser  --json  --seconds N
+
+Recuperación de emergencia:  sudo nft delete table inet wifipublica
+EOF
+}
+
+# ===========================================================================
+#  Lanzador como usuario (sin root)
+# ===========================================================================
+
+priv() {
+  [[ -x $WP_ROOT_BIN ]] || die "wifi-publica no está instalado (revisa y ejecuta: sudo ./install.sh)"
+  if is_tty; then sudo "$WP_ROOT_BIN" "$@"
+  else sudo -n "$WP_ROOT_BIN" "$@"
+  fi
+}
+
+menu_pick() {
+  # walker 2.x: --dmenu (-d) y --placeholder (-p). Comprobado con walker 2.17.2;
+  # verifica en tu versión con:  walker --help | grep -E 'dmenu|placeholder'
+  # fuzzel: --dmenu --prompt;  wofi: --dmenu --prompt (man fuzzel / man wofi).
+  local prompt=$1
+  if have walker; then walker --dmenu --placeholder "$prompt"
+  elif have fuzzel; then fuzzel --dmenu --prompt "$prompt> "
+  elif have wofi; then wofi --dmenu --prompt "$prompt"
+  else
+    notify-send -a "Wifi pública" "Sin selector" "Instala walker, fuzzel o wofi" 2>/dev/null || true
+    return 1
+  fi
+}
+
+user_notify() { notify-send -a "Wifi pública" -u "$1" "$2" "$3" 2>/dev/null || true; }
+
+# Ejecuta un comando privilegiado; si el backend pide confirmación (código 10)
+# y no hay terminal, la pide con el selector gráfico.
+priv_confirmable() {
+  local rc=0
+  priv "$@" || rc=$?
+  if (( rc == 10 )) && ! is_tty; then
+    local a
+    a=$(printf '%s\n' "Cancelar" "Sí, apagar la VPN (el kill switch bloqueará TODO)" \
+      | menu_pick "¿Apagar la VPN con el modo activo?") || return 0
+    if [[ $a == Sí* ]]; then priv --yes "$@"; else return 0; fi
+  elif (( rc != 0 )); then
+    is_tty || user_notify critical "Wifi pública" "Error ($rc) en: wifi-publica $*. Mira /var/log/wifi-publica.log"
+    return "$rc"
+  fi
+}
+
+user_vpn_menu() {
+  local lines name active entries=() sel up
+  lines=$(priv vpn list --plain) || { user_notify critical "VPN" "No se pudo listar los servidores (¿instalado?)"; return 1; }
+  vpn_is_up && up=1 || up=0
+  if (( up )); then entries+=("⏻  Apagar VPN"); else entries+=("⏻  Encender VPN"); fi
+  while IFS=$'\t' read -r name active; do
+    [[ -n $name ]] || continue
+    if [[ $active == 1 ]]; then entries+=("● $name (activo)"); else entries+=("○ $name"); fi
+  done <<<"$lines"
+  sel=$(printf '%s\n' "${entries[@]}" | menu_pick "Servidor VPN") || return 0
+  case $sel in
+    "⏻  Apagar VPN") priv_confirmable vpn off ;;
+    "⏻  Encender VPN") priv_confirmable vpn on ;;
+    "● "*) : ;;
+    "○ "*)
+      name=${sel#○ }
+      valid_server_name "$name" || return 1
+      priv_confirmable vpn use "$name" ;;
+  esac
+}
+
+# Datos de la VPN que requieren root (handshake): caché de 30 s para no
+# llamar a sudo en cada refresco de la barra.
+user_vpn_probe() {
+  local cache="${XDG_RUNTIME_DIR:-/tmp}/wifi-publica-probe" age=999999
+  [[ -f $cache ]] && age=$(( $(date +%s) - $(stat -c %Y "$cache") ))
+  local ttl=30
+  vpn_is_up || ttl=300
+  if (( age > ttl )) && [[ -x $WP_ROOT_BIN ]]; then
+    timeout 5 sudo -n "$WP_ROOT_BIN" vpn _probe >"$cache.tmp" 2>/dev/null && mv -f "$cache.tmp" "$cache" || rm -f "$cache.tmp"
+  fi
+  [[ -f $cache ]] && cat "$cache"
+  return 0
+}
+
+# ===========================================================================
+#  status (sin root)
+# ===========================================================================
+
+cmd_status() {
+  local mode measures ks portal up server ip hs_age="" rx=0 tx=0 score="" k v klass vklass
+  mode=$(mode_get)
+  measures=$(applied_count 2>/dev/null || echo 0)
+  ks=$(st_get vpn.killswitch 2>/dev/null || echo 0)
+  portal=$(st_get portal 2>/dev/null || echo 0)
+  if vpn_is_up; then up=1; else up=0; fi
+  server=$(vs_get server 2>/dev/null || true)
+  ip=$(vs_get public_ip 2>/dev/null || true)
+  if (( EUID == 0 )); then
+    server=$(vpn_active_server 2>/dev/null || echo "$server")
+    if (( up )); then
+      local e; e=$(vpn_handshake_epoch); (( e > 0 )) && hs_age=$(( $(date +%s) - e ))
+    fi
+  else
+    while IFS='=' read -r k v; do
+      case $k in
+        server) [[ -n $v ]] && server=$v ;;
+        handshake_age) hs_age=$v ;;
+      esac
+    done < <(user_vpn_probe)
+  fi
+  if (( up )); then
+    rx=$(cat "/sys/class/net/$WG_IFACE/statistics/rx_bytes" 2>/dev/null || echo 0)
+    tx=$(cat "/sys/class/net/$WG_IFACE/statistics/tx_bytes" 2>/dev/null || echo 0)
+  fi
+  score=$(kv_get "$WP_AUDIT" score 2>/dev/null || true)
+  local audit_at; audit_at=$(kv_get "$WP_AUDIT" at 2>/dev/null || true)
+  [[ $server =~ ^[A-Za-z0-9._-]*$ ]] || server=""
+  [[ $hs_age =~ ^[0-9]*$ ]] || hs_age=""
+
+  case $mode in
+    active|applying)
+      if (( ks && up )); then klass=secure
+      elif (( ks )); then klass=blocked
+      else klass=novpn; fi ;;
+    portal) klass=portal ;;
+    *) klass=inactive ;;
+  esac
+  if (( up )); then
+    if [[ -n $hs_age ]] && (( hs_age <= 180 )); then vklass=connected
+    elif [[ -z $hs_age ]]; then vklass=connected
+    else vklass=stale; fi
+  elif [[ -n $(vs_get last_error 2>/dev/null || true) ]]; then vklass=error
+  else vklass=disconnected; fi
+
+  if (( OPT_JSON )); then
+    printf '{"mode":"%s","class":"%s","measures":%s,"killswitch":%s,"portal":%s,' \
+      "$mode" "$klass" "${measures:-0}" "$([[ $ks == 1 ]] && echo true || echo false)" "$([[ $portal == 1 ]] && echo true || echo false)"
+    printf '"vpn":{"up":%s,"class":"%s","server":"%s","public_ip":"%s","handshake_age":%s,"rx":%s,"tx":%s,"error":"%s"},' \
+      "$([[ $up == 1 ]] && echo true || echo false)" "$vklass" "$(json_escape "$server")" "$(json_escape "$ip")" \
+      "${hs_age:-null}" "$rx" "$tx" "$(json_escape "$(vs_get last_error 2>/dev/null || true)")"
+    printf '"audit":{"score":%s,"at":"%s"}}\n' "${score:-null}" "$(json_escape "$audit_at")"
+    return 0
+  fi
+  local label
+  case $mode in
+    active|applying) label="${C_GREEN}ACTIVO${C_RESET}" ;;
+    portal) label="${C_YELLOW}PORTAL${C_RESET}" ;;
+    *) label="${C_GREY}INACTIVO${C_RESET}" ;;
+  esac
+  printf '%s · %s medidas · VPN %s%s%s%s\n' "$label" "$measures" \
+    "$([[ $up == 1 ]] && echo sí || echo no)" "${server:+ ($server)}" \
+    "$([[ $ks == 1 ]] && echo ' · kill switch' || true)" "${score:+ · audit $score/100}"
+}
+
+# ===========================================================================
+#  Modo wifi pública (root)
+# ===========================================================================
+
+cancel_portal_timer() {
+  (( DRY_RUN )) && return 0
+  systemctl stop "$PORTAL_UNIT.timer" >/dev/null 2>&1 || true
+}
+
+apply_measure() {
+  local m=$1
+  "m_${m}_apply"
+  applied_add "$m"
+}
+
+revert_measure() {
+  local m=$1
+  "m_${m}_revert" || warn "fallo al revertir '$m'"
+  applied_del "$m" || true
+}
+
+ROLLBACK_ACTIVE=0
+on_failed() {
+  local rc=$?
+  (( ROLLBACK_ACTIVE )) || return 0
+  ROLLBACK_ACTIVE=0
+  trap - EXIT
+  set +e
+  (( rc != 0 )) || rc=1
+  err "fallo al activar el modo: revirtiendo lo aplicado"
+  # shellcheck disable=SC2034  # vacía la cola de lib/nm.sh antes de revertir
+  NM_Q=() NM_Q_UUID="" NM_Q_RECONNECT=0
+  revert_all
+  notify critical "Wifi pública: error" "No se pudo activar el modo; se ha revertido todo. Mira /var/log/wifi-publica.log"
+  exit "$rc"
+}
+
+revert_all() {
+  local list i m arr
+  list=$(applied_list)
+  read -r -a arr <<<"$list"
+  for (( i = ${#arr[@]} - 1; i >= 0; i-- )); do
+    m=${arr[i]}
+    [[ " ${MEASURES[*]} " == *" $m "* ]] || continue
+    revert_measure "$m"
+  done
+  # Restos aunque no figuren como aplicados (p. ej. fallo a medias).
+  m_ipv6_revert || true
+  m_dns_revert || true
+  m_mac_revert || true
+  _hostname_revert_nm || true
+  nm_commit || warn "no se pudo restaurar la configuración de NetworkManager"
+  m_ipv6_post_revert || true
+  fw_delete || true
+}
+
+cmd_on() {
+  WP_CMD=on
+  take_lock
+  cancel_portal_timer
+  ensure_rundir
+  local mode; mode=$(mode_get)
+  [[ -n ${SUDO_USER:-} && $SUDO_USER != root ]] && vs_set user "$SUDO_USER"
+  if [[ $mode == inactive ]]; then
+    st_set mode applying since "$(date +%s)"
+    if ! vpn_is_up && (( ! DRY_RUN )); then st_set pre_ip "$(public_ip)"; fi
+  fi
+  st_set portal 0
+  log "activando modo (estado previo: $mode)"
+
+  # Si cualquier paso falla (set -e), la trampa EXIT revierte lo aplicado.
+  # (No se usa ERR + set -E: se heredaría en las subshells $(...).)
+  ROLLBACK_ACTIVE=1
+  trap on_failed EXIT
+  trap 'exit 130' INT TERM HUP
+
+  apply_measure services
+  apply_measure docker
+  apply_measure bluetooth
+  apply_measure autoconnect
+  apply_measure tailscale
+  nm_detect_uplink || warn "sin conexión activa gestionada por NetworkManager: MAC, DNS, IPv6 y hostname por DHCP no aplicables"
+  apply_measure hostname
+  apply_measure mac
+  apply_measure dns
+  apply_measure ipv6
+  nm_commit
+  m_ipv6_post_apply
+  apply_measure firewall
+  apply_measure vpn
+  apply_measure session
+
+  ROLLBACK_ACTIVE=0
+  trap - EXIT
+  st_set mode active
+  # La reconexión o la VPN pueden haber hecho que NetworkManager restaure el
+  # hostname estático.
+  m_hostname_reassert
+  bump_rev
+  log "modo activo: $(applied_list)"
+
+  say ""
+  cmd_audit quiet
+  local score ks
+  score=$(kv_get "$WP_AUDIT" score 2>/dev/null || echo "?")
+  ks=$(st_get vpn.killswitch 2>/dev/null || echo 0)
+  if [[ $ks == 1 ]]; then
+    notify normal "Wifi pública ACTIVA" "VPN '$(vpn_active_server)' + kill switch · audit ${score}/100"
+  else
+    notify critical "Wifi pública ACTIVA (sin VPN)" "Dominios y metadatos visibles para la red · audit ${score}/100"
+  fi
+}
+
+cmd_off() {
+  WP_CMD=off
+  take_lock
+  cancel_portal_timer
+  local mode; mode=$(mode_get)
+  if [[ $mode == inactive ]]; then
+    if have nft && nft_table_exists; then fw_delete; fi
+    say "El modo ya estaba inactivo."
+    return 0
+  fi
+  set +e
+  nm_detect_uplink || true
+  local list i m arr
+  list=$(applied_list)
+  read -r -a arr <<<"$list"
+  for (( i = ${#arr[@]} - 1; i >= 0; i-- )); do
+    m=${arr[i]}
+    [[ " ${MEASURES[*]} " == *" $m "* ]] || continue
+    revert_measure "$m"
+    if [[ $m == hostname ]]; then
+      nm_commit || warn "no se pudo restaurar NetworkManager"
+      m_ipv6_post_revert
+    fi
+  done
+  # Por si el modo se quedó a medias.
+  m_ipv6_revert; m_dns_revert; m_mac_revert; _hostname_revert_nm
+  nm_commit || warn "no se pudo restaurar NetworkManager"
+  m_ipv6_post_revert
+  fw_delete
+  set -e
+  if (( ! DRY_RUN )); then rm -f "$WP_STATE" "$WP_AUDIT"; fi
+  bump_rev
+  log "modo desactivado"
+  if (( ${#WARNINGS[@]} )); then
+    notify normal "Wifi pública desactivada" "Con ${#WARNINGS[@]} avisos (mira la terminal o el registro)"
+  else
+    notify low "Wifi pública desactivada" "Estado anterior restaurado"
+  fi
+  ok "modo desactivado y estado anterior restaurado"
+}
+
+cmd_portal() {
+  WP_CMD=portal
+  need_cmd nft nftables || die "el modo portal necesita nftables"
+  take_lock
+  ensure_rundir
+  cancel_portal_timer
+  local mode; mode=$(mode_get)
+  [[ -n ${SUDO_USER:-} && $SUDO_USER != root ]] && vs_set user "$SUDO_USER"
+  nm_detect_uplink || true
+  if [[ $mode == inactive ]]; then
+    st_set mode portal since "$(date +%s)"
+    if ! vpn_is_up && (( ! DRY_RUN )); then st_set pre_ip "$(public_ip)"; fi
+  else
+    # Pausa VPN/kill switch y DoT; "on" los volverá a aplicar.
+    if applied_has vpn; then revert_measure vpn; fi
+    if applied_has dns; then revert_measure dns; nm_commit; fi
+    st_set mode portal
+  fi
+  st_set portal 1 vpn.killswitch 0
+  fw_rebuild
+  applied_add firewall
+  # Si se bajó la VPN, NetworkManager puede haber restaurado el hostname.
+  m_hostname_reassert 1
+  run systemd-run --quiet --unit="$PORTAL_UNIT" --on-active="${PORTAL_SECONDS}s" \
+    --timer-property=AccuracySec=1s --description="wifi-publica: reactivar tras el portal" \
+    "$WP_ROOT_BIN" on
+  bump_rev
+  say "Portal cautivo: solo DNS (53), HTTP (80) y HTTPS (443) durante ${PORTAL_SECONDS} s."
+  say "Abre ${C_BOLD}http://neverssl.com${C_RESET} para que aparezca la página de acceso."
+  say "NO introduzcas contraseñas en el portal. El modo se reactiva solo (o ejecuta 'wifi-publica on')."
+  notify critical "Portal cautivo (${PORTAL_SECONDS} s)" "Abre http://neverssl.com · no introduzcas contraseñas · el modo se reactivará solo"
+}
+
+# ===========================================================================
+#  audit (solo lectura)
+# ===========================================================================
+
+cmd_audit() {
+  local quiet=${1:-} m res status msg pts=0 total=0 w icon color n_ok=0 n_warn=0 n_bad=0 n_na=0 score
+  nm_detect_uplink || true
+  if [[ $quiet != quiet ]]; then
+    printf '%sAudit wifi pública%s — %s — %s\n' "$C_BOLD" "$C_RESET" "$(date '+%F %T')" "modo $(mode_get)"
+  fi
+  printf '  %-12s %-6s %s\n' MEDIDA ESTADO DETALLE
+  for m in "${MEASURES[@]}"; do
+    res=$("m_${m}_check" 2>/dev/null || echo "na|error al comprobar")
+    status=${res%%|*} msg=${res#*|}
+    w=${WEIGHT[$m]:-0}
+    case $status in
+      ok)   icon="✔ OK"; color=$C_GREEN; pts=$((pts + w)); total=$((total + w)); n_ok=$((n_ok + 1)) ;;
+      warn) icon="! AVISO"; color=$C_YELLOW; pts=$((pts + w / 2)); total=$((total + w)); n_warn=$((n_warn + 1)) ;;
+      bad)  icon="✗ MAL"; color=$C_RED; total=$((total + w)); n_bad=$((n_bad + 1)) ;;
+      *)    icon="· N/A"; color=$C_GREY; n_na=$((n_na + 1)) ;;
+    esac
+    printf '  %-12s %s%-8s%s %s\n' "$m" "$color" "$icon" "$C_RESET" "$msg"
+  done
+  if (( total > 0 )); then score=$(( (pts * 100 + total / 2) / total )); else score=0; fi
+  local sc=$C_RED
+  (( score >= 60 )) && sc=$C_YELLOW
+  (( score >= 85 )) && sc=$C_GREEN
+  printf '\n  Puntuación: %s%s/100%s  (%s ok, %s avisos, %s mal, %s n/a)\n' "$sc" "$score" "$C_RESET" "$n_ok" "$n_warn" "$n_bad" "$n_na"
+  if (( EUID == 0 && ! DRY_RUN )); then
+    ensure_rundir
+    kv_set "$WP_AUDIT" score "$score" at "$(date '+%F %T')" ok "$n_ok" warn "$n_warn" bad "$n_bad" na "$n_na"
+    bump_rev
+  fi
+}
+
+# ===========================================================================
+#  Capa VPN (root)
+# ===========================================================================
+
+vpn_require_tools() {
+  need_cmd wg-quick wireguard-tools || die "instala wireguard-tools"
+  need_cmd wg wireguard-tools || die "instala wireguard-tools"
+}
+
+cmd_vpn_on() {
+  WP_CMD="vpn on"
+  vpn_require_tools
+  take_lock
+  ensure_rundir
+  local name pre
+  name=$(vpn_active_server) || die "no hay servidor activo: importa uno con 'wifi-publica vpn import <f.conf>'"
+  if vpn_is_up; then say "La VPN ya está activa ($name)."; return 0; fi
+  vpn_load_server "$name" || exit 1   # el motivo ya se ha mostrado
+  if mode_is_active && [[ $(mode_get) != portal ]]; then
+    # Con el modo activo: el endpoint debe estar permitido antes de subir.
+    st_set vpn.ep_ip "$VPN_EP_IP" vpn.ep_port "$VPN_EP_PORT" vpn.server "$name"
+    killswitch_on && fw_swap_endpoint "$VPN_EP_IP" "$VPN_EP_PORT"
+    pre=$(st_get pre_ip 2>/dev/null || true)
+  else
+    pre=$(public_ip)
+  fi
+  if ! vpn_up_checked "$pre"; then
+    bump_rev
+    notify critical "VPN: error" "No se pudo conectar a '$name' (sin handshake o IP sin cambiar)"
+    die "no se pudo conectar a '$name'"
+  fi
+  if mode_is_active && [[ $(mode_get) != portal ]] && ! killswitch_on; then
+    st_has vpn.was_up || st_set vpn.was_up 0
+    st_set vpn.killswitch 1
+    fw_rebuild
+    applied_add vpn
+    ok "kill switch activado"
+  fi
+  vs_set server "$name"
+  m_hostname_reassert
+  bump_rev
+  ok "VPN activa: $name ($(vs_get public_ip 2>/dev/null || echo 'IP no comprobada'))"
+  notify normal "VPN conectada" "$name · IP $(vs_get public_ip 2>/dev/null || echo '?')"
+}
+
+cmd_vpn_off() {
+  WP_CMD="vpn off"
+  vpn_require_tools
+  take_lock
+  if ! vpn_is_up; then say "La VPN ya está apagada."; return 0; fi
+  if mode_is_active && killswitch_on; then
+    if (( ! ASSUME_YES )); then
+      if ! is_tty; then
+        err "el kill switch está activo: apagar la VPN deja el equipo SIN internet. Repite con --yes"
+        exit 10
+      fi
+      confirm "El kill switch seguirá bloqueando TODO el tráfico hasta 'wifi-publica off' o 'wifi-publica portal'. ¿Apagar la VPN? [s/N]" n \
+        || { say "Cancelado."; return 0; }
+    fi
+    warn "VPN apagada con el kill switch activo: sin internet hasta 'wifi-publica off' o 'portal'"
+  fi
+  vpn_down
+  vs_set public_ip ""
+  # Al desaparecer "home", NetworkManager restaura el hostname estático.
+  m_hostname_reassert 1
+  bump_rev
+  ok "VPN apagada"
+  if mode_is_active && killswitch_on; then
+    notify critical "VPN apagada · SIN INTERNET" "El kill switch bloquea todo. 'wifi-publica off' o 'portal' para salir"
+  else
+    notify low "VPN apagada" "Tráfico sin túnel"
+  fi
+}
+
+cmd_vpn_toggle() {
+  if vpn_is_up; then cmd_vpn_off; else cmd_vpn_on; fi
+}
+
+cmd_vpn_use() {
+  local target=$1
+  # shellcheck disable=SC2034  # WP_CMD lo lee log() en lib/common.sh
+  WP_CMD="vpn use"
+  vpn_require_tools
+  valid_server_name "$target" || die "nombre de servidor no válido" 2
+  take_lock
+  ensure_rundir
+  local prev was_up=0 ks=0 prev_ip="" prev_port=""
+  # 1. Validar destino
+  vpn_load_server "$target" || exit 1   # el motivo ya se ha mostrado
+  local new_ip=$VPN_EP_IP new_port=$VPN_EP_PORT
+  # 2. Guardar el anterior
+  prev=$(vpn_active_server 2>/dev/null || true)
+  if [[ $prev == "$target" ]]; then say "'$target' ya es el servidor activo."; return 0; fi
+  vpn_is_up && was_up=1
+  if mode_is_active && killswitch_on; then
+    ks=1
+    prev_ip=$(st_get vpn.ep_ip 2>/dev/null || true)
+    prev_port=$(st_get vpn.ep_port 2>/dev/null || true)
+  fi
+  # 3. Bajar si estaba arriba
+  (( was_up )) && vpn_down
+  # 4. Cambiar el enlace
+  vpn_point_link "$target"
+  if (( ! was_up )); then
+    bump_rev
+    ok "servidor activo: $target (la VPN sigue apagada)"
+    notify low "VPN: servidor cambiado" "$target (VPN apagada)"
+    return 0
+  fi
+  # 5. Kill switch: solo la regla del endpoint, antes de subir
+  if (( ks )); then
+    st_set vpn.ep_ip "$new_ip" vpn.ep_port "$new_port" vpn.server "$target"
+    fw_swap_endpoint "$new_ip" "$new_port"
+  fi
+  # 6. Subir y comprobar
+  local pre=""
+  (( ks )) && pre=$(st_get pre_ip 2>/dev/null || true)
+  if vpn_up_checked "$pre"; then
+    # El "wg-quick down" del paso 3 hace que NetworkManager restaure el
+    # hostname estático; para entonces ya lo ha hecho (handshake de por medio).
+    m_hostname_reassert
+    bump_rev
+    ok "servidor cambiado: ${prev:-?} → $target"
+    notify normal "VPN: $target" "Conectada · IP $(vs_get public_ip 2>/dev/null || echo '?')"
+    return 0
+  fi
+  # 7. Vuelta atrás
+  err "fallo con '$target': volviendo a '${prev:-ninguno}'"
+  if [[ -n $prev ]]; then
+    vpn_point_link "$prev"
+    if (( ks )); then
+      st_set vpn.ep_ip "$prev_ip" vpn.ep_port "$prev_port" vpn.server "$prev"
+      fw_swap_endpoint "$prev_ip" "$prev_port"
+    fi
+    vpn_up_checked "" || warn "tampoco se pudo reconectar a '$prev'"
+  fi
+  m_hostname_reassert 1
+  bump_rev
+  notify critical "VPN: fallo al cambiar" "'$target' no conecta; restaurado '${prev:-ninguno}'"
+  return 1
+}
+
+cmd_vpn_cycle() {
+  local dir=$1 servers cur i n idx=-1
+  mapfile -t servers < <(vpn_servers)
+  n=${#servers[@]}
+  (( n > 0 )) || die "no hay servidores guardados"
+  cur=$(vpn_active_server 2>/dev/null || true)
+  for (( i = 0; i < n; i++ )); do [[ ${servers[i]} == "$cur" ]] && idx=$i; done
+  if [[ $dir == next ]]; then idx=$(( (idx + 1) % n )); else idx=$(( (idx - 1 + n) % n )); fi
+  if [[ ${servers[idx]} == "$cur" ]]; then
+    say "Solo hay un servidor guardado."
+    notify low "VPN" "Solo hay un servidor guardado ($cur)"
+    return 0
+  fi
+  cmd_vpn_use "${servers[idx]}"
+}
+
+cmd_vpn_list() {
+  local cur s ep
+  cur=$(vpn_active_server 2>/dev/null || true)
+  if (( OPT_PLAIN )); then
+    while IFS= read -r s; do printf '%s\t%s\n' "$s" "$([[ $s == "$cur" ]] && echo 1 || echo 0)"; done < <(vpn_servers)
+    return 0
+  fi
+  printf '  %-2s %-28s %-24s %s\n' "" SERVIDOR ENDPOINT ESTADO
+  while IFS= read -r s; do
+    if wgconf_check "$(vpn_server_file "$s")" >/dev/null; then ep="$WGC_EP_HOST:$WGC_EP_PORT"; else ep="(no válido)"; fi
+    if [[ $s == "$cur" ]]; then
+      printf '  %s* %-28s%s %-24s %s\n' "$C_GREEN" "$s" "$C_RESET" "$ep" "$(vpn_is_up && echo conectada || echo 'activo, apagada')"
+    else
+      printf '    %-28s %-24s\n' "$s" "$ep"
+    fi
+  done < <(vpn_servers)
+}
+
+cmd_vpn_status() {
+  if (( OPT_JSON )); then cmd_status; return; fi
+  local name hs age=""
+  name=$(vpn_active_server 2>/dev/null || echo "(ninguno)")
+  if vpn_is_up; then
+    hs=$(vpn_handshake_epoch); (( hs > 0 )) && age=$(( $(date +%s) - hs ))
+    read -r rx tx < <(wg show "$WG_IFACE" transfer 2>/dev/null | parse_wg_transfer)
+    say "VPN conectada · $name · handshake hace ${age:-?}s · ↓${rx:-0} B ↑${tx:-0} B · IP $(vs_get public_ip 2>/dev/null || echo '?')"
+  else
+    say "VPN apagada · servidor activo: $name"
+  fi
+}
+
+# Uso interno de la barra: datos que requieren root, formato clave=valor.
+cmd_vpn_probe() {
+  local name hs
+  name=$(vpn_active_server 2>/dev/null || true)
+  printf 'server=%s\n' "$name"
+  if vpn_is_up; then
+    hs=$(vpn_handshake_epoch)
+    (( hs > 0 )) && printf 'handshake_age=%s\n' "$(( $(date +%s) - hs ))"
+  fi
+  if [[ -n $name && $(vs_get server 2>/dev/null || true) != "$name" ]]; then
+    ensure_rundir; vs_set server "$name"
+  fi
+  return 0
+}
+
+
+# ===========================================================================
+#  Argumentos y despacho
+# ===========================================================================
+
+
+# vpn import (como usuario): se delega en el ejecutable SEPARADO, que el
+# sudoers solo permite CON contraseña (una por invocación, aunque sea un
+# lote). Nunca con "sudo -n".
+user_vpn_import() {
+  local a fwd=() f
+  (( ${#POS[@]} >= 3 )) || die "uso: wifi-publica vpn import <fichero.conf>... | <fichero.conf> <nombre>" 2
+  for a in "${ORIG_ARGS[@]}"; do
+    case $a in
+      --yes|-y|--dry-run|-n) fwd+=("$a") ;;
+      -*) [[ $a == -- ]] || die "opción no permitida con vpn import: $a" 2 ;;
+    esac
+  done
+  fwd+=(--)
+  # Rutas absolutas SIN resolver enlaces (el importador los rechaza), siempre
+  # entre comillas: admite espacios ("mis servidores vpn").
+  for f in "${POS[@]:2}"; do
+    if [[ $f == *.conf && $f != /* ]]; then f="$(pwd -P)/$f"; fi
+    fwd+=("$f")
+  done
+  if (( DRY_RUN )); then
+    exec "$WP_BASE/bin/wifi-publica-import" "${fwd[@]}"
+  fi
+  [[ -x $WP_IMPORT_BIN ]] || die "wifi-publica no está instalado (revisa y ejecuta: sudo ./install.sh)"
+  is_tty || die "vpn import pide tu contraseña: ejecútalo en una terminal"
+  exec sudo "$WP_IMPORT_BIN" "${fwd[@]}"
+}
+
+ORIG_ARGS=()
+main() {
+  validate_argv "$@"
+  ORIG_ARGS=("$@")
+  local orig=("$@") route
+  parse_args "$@"
+  local cmd=${POS[0]:-help} sub=${POS[1]:-}
+
+  # Comandos que no necesitan root.
+  case "$cmd:$sub" in
+    help:*|:*) usage; return 0 ;;
+    status:*) cmd_status; return 0 ;;
+    vpn:menu) (( EUID != 0 )) || die "ejecuta 'vpn menu' como tu usuario"; user_vpn_menu; return ;;
+    vpn:import)
+      (( EUID != 0 )) || die "como root usa: $WP_IMPORT_BIN <fichero.conf> [nombre]" 2
+      user_vpn_import; return ;;
+  esac
+
+  route=$(route_root "${POS[@]}")
+  if [[ $route == reject:* ]]; then
+    err "${route#reject:}: ${POS[*]}"
+    usage >&2
+    exit 2
+  fi
+
+  # Como usuario: se reejecuta con sudo (salvo --dry-run, que no cambia nada).
+  if (( EUID != 0 )); then
+    if (( DRY_RUN )); then
+      say "${C_YELLOW}dry-run sin root: lo que requiere root se muestra o se omite. Para el plan completo: sudo wifi-publica ${orig[*]}${C_RESET}"
+    else
+      case $route in
+        on) priv_confirmable "${orig[@]}" && (( OPT_BROWSER )) && m_browser_launch; return 0 ;;
+        toggle)
+          if [[ $(mode_get) == inactive ]]; then
+            local a fwd=()
+            for a in "${orig[@]}"; do [[ $a == toggle ]] && a=on; fwd+=("$a"); done
+            priv_confirmable "${fwd[@]}" && (( OPT_BROWSER )) && m_browser_launch
+          else priv_confirmable off; fi
+          return 0 ;;
+        *) priv_confirmable "${orig[@]}"; return ;;
+      esac
+    fi
+  fi
+
+  case $route in
+    on) cmd_on ;;
+    off) cmd_off ;;
+    toggle) if [[ $(mode_get) == inactive ]]; then cmd_on; else cmd_off; fi ;;
+    portal) cmd_portal ;;
+    audit) cmd_audit ;;
+    vpn_on) cmd_vpn_on ;;
+    vpn_off) cmd_vpn_off ;;
+    vpn_toggle) cmd_vpn_toggle ;;
+    vpn_status) cmd_vpn_status ;;
+    vpn_list) cmd_vpn_list ;;
+    vpn_use) cmd_vpn_use "${POS[2]}" ;;
+    vpn_next) cmd_vpn_cycle next ;;
+    vpn_prev) cmd_vpn_cycle prev ;;
+    vpn__probe) cmd_vpn_probe ;;
+    *) die "ruta interna desconocida: $route" 2 ;;
+  esac
+  if (( DRY_RUN )) && [[ $route == on && $OPT_BROWSER == 1 ]]; then m_browser_launch; fi
+}
+
+main "$@"

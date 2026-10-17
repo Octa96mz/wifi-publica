@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# wifi-publica-import — importa un .conf de WireGuard a /etc/wireguard/servers.
+#
+# Es un ejecutable SEPARADO a propósito: el sudoers lo permite solo CON
+# contraseña (y con timestamp_timeout=0, así que la pide siempre), mientras
+# que bin/wifi-publica tiene la regla sin contraseña y no puede importar.
+# sudo elige la regla por la ruta/inodo del ejecutable, no por los argumentos,
+# así que no hay forma de llegar aquí por la regla NOPASSWD.
+#
+# Uso: wifi-publica vpn import <fichero.conf>... | <fichero.conf> <nombre>
+#      sudo /usr/local/lib/wifi-publica/bin/wifi-publica-import [--dry-run] <fichero.conf>...
+#      (hasta 20 ficheros; una sola contraseña por invocación)
+#      sudo /usr/local/lib/wifi-publica/bin/wifi-publica-import remove <nombre>
+
+set -euo pipefail
+umask 022
+PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin
+export PATH LC_ALL=C.UTF-8
+
+WP_BASE=$(cd -P -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/.." && pwd)
+
+if (( EUID == 0 )); then
+  # shellcheck source=../lib/common.sh
+  source "/usr/local/lib/wifi-publica/lib/common.sh"
+  verify_install_integrity "$WP_BASE"
+fi
+
+for _f in common state parse wgconf vpn cli import remove; do
+  # shellcheck source=/dev/null
+  source "$WP_BASE/lib/$_f.sh"
+done
+unset _f
+
+# Los temporales (que contienen la clave privada) se borran al salir, también
+# con Ctrl+C, SIGTERM o SIGHUP. Ante kill -9 no hay trampa posible: los restos
+# se borran al arrancar la siguiente importación (import_purge_stale).
+trap import_cleanup EXIT
+trap 'exit 130' INT TERM HUP
+
+validate_argv "$@"
+
+# Borrado: "remove <nombre>" exactamente. Solo como root (nunca dry-run).
+if [[ ${1:-} == remove ]]; then
+  parse_remove_args "$@" || exit 2
+  (( EUID == 0 )) || die "ejecuta: sudo $WP_IMPORT_BIN remove <nombre> (te pedirá tu contraseña)" 2
+  take_lock
+  cmd_vpn_remove "$REMOVE_NAME"
+  exit 0
+fi
+
+parse_import_args "$@" || exit 2
+if (( EUID != 0 && ! DRY_RUN )); then
+  die "ejecuta: wifi-publica vpn import <fichero.conf> [nombre] (te pedirá tu contraseña)" 2
+fi
+# Solo se escribe de verdad como root y sin --dry-run. Se fija aquí, nunca
+# desde el entorno.
+IMPORT_REAL=0
+if (( EUID == 0 && ! DRY_RUN )); then IMPORT_REAL=1; fi
+take_lock
+if (( IMPORT_REAL )); then import_purge_stale; fi
+cmd_vpn_import

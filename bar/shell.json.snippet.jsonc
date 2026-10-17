@@ -1,0 +1,19 @@
+// Añade estas dos entradas a "bar" → "layout" → "right" en
+// ~/.config/omarchy/shell.json (se recarga en caliente al guardar).
+// Ejemplo con tu layout actual (antes de omarchy.network):
+//
+//   "right": [
+//     { "id": "omarchy.tray" },
+//     { "id": "omarchy.agents" },
+//     { "id": "omarchy.bluetooth" },
+//     { "id": "wifipublica-mode", "type": "qml" },
+//     { "id": "wifipublica-vpn", "type": "qml" },
+//     { "id": "omarchy.network" },
+//     ...
+//   ]
+//
+// Los ficheros van en ~/.config/omarchy/bar/modules/<id>.qml (ruta por
+// defecto según /usr/share/omarchy/shell/plugins/bar/README.md; para otra
+// ruta añade "source"). Ajuste opcional: "command" si el script no está en el PATH.
+{ "id": "wifipublica-mode", "type": "qml" },
+{ "id": "wifipublica-vpn", "type": "qml" }
